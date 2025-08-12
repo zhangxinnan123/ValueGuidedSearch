@@ -14,7 +14,7 @@ import eval_helpers
 import math
 import numpy as np
 import copy
-import sglang as sgl
+from vllm import LLM, SamplingParams
 
 
 def get_token_ids(list_of_token_strs, tokenizer):
@@ -56,10 +56,8 @@ class Args:
     attention_impl: str = "flash_attention_2"
     seed: int = 1337
     piref_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    use_sglang_server: bool = False
-    sglang_port: int = 30000
     classifier_ckpt_path: str = "VGS-AI/DeepSeek-VM-1.5B"
-    output_path: str = "inference_outputs.jsonl"
+    output_path: str = "inference_outputs_vllm.jsonl"
     search_type: str = "beam2"
     # fraction of memory to allocate to piref inference engine
     piref_gpu_util: float = 0.5
@@ -72,10 +70,26 @@ class Args:
     top_p: float = 0.95
     num_repetitions: int = 1  # number of times to repeat the generation for each input
 
+    # vLLM specific parameters
+    tensor_parallel_size: int = 1
+    max_model_len: int = 32768
 
 
     def __post_init__(self):
         print("classifier_ckpt_path: ", self.classifier_ckpt_path)
+        
+        # Create parameter-based directory structure
+        param_dir = f"results/{self.benchmark}_bs{self.batch_size}_nb{self.num_blocks}_bz{self.block_size}_rep{self.num_repetitions}"
+        
+        # If output_path is just a filename, put it in the parameter directory
+        if "/" not in self.output_path:
+            self.output_path = os.path.join(param_dir, self.output_path)
+        else:
+            # If it already has a directory structure, insert the parameter directory
+            output_dir = os.path.dirname(self.output_path)
+            filename = os.path.basename(self.output_path)
+            self.output_path = os.path.join(output_dir, param_dir, filename)
+        
         print("output_path: ", self.output_path)
         output_dir = os.path.dirname(self.output_path)
         if output_dir:  # Only create directory if there is one
@@ -116,18 +130,18 @@ def maybe_finish_generate_and_score(
                 max_num_tokens_list.append(max_length - len(generation_ids[i][j]))
 
     if len(infer_input_ids) > 0:
-        sampling_params = [
-            dict(
-                temperature=temperature,
-                top_p=top_p,
-                skip_special_tokens=False,
-                stop_token_ids=stop_token_ids,
-                max_new_tokens=max_num_tokens_list[i],
-            ) for i in range(len(infer_input_ids))
-        ]
-        infer_outputs = piref_model.generate(input_ids=infer_input_ids, sampling_params=sampling_params)
-        infer_output_ids = [x['output_ids'] for x in infer_outputs]
-        del infer_outputs
+        # Convert to vLLM sampling params
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max(max_num_tokens_list),  # vLLM uses single max_tokens
+            stop_token_ids=stop_token_ids,
+            skip_special_tokens=False,
+        )
+        
+        # vLLM expects token_ids format for input
+        infer_outputs = piref_model.generate(prompt_token_ids=infer_input_ids, sampling_params=sampling_params)
+        infer_output_ids = [list(output.outputs[0].token_ids) for output in infer_outputs]
 
         k = 0
         # create a copy to avoid modifying the original generation_ids
@@ -154,7 +168,7 @@ def score_all_generations(classifier_model, prompt_ids, generation_ids, device_t
         for j in range(num_responses):
             input_output_ids.append(prompt_ids[i] + generation_ids[i][j])
 
-    # since we give lots of memory to sgl, the classifier might oom here. thus, we for loop to save memory
+    # since we give lots of memory to vllm, the classifier might oom here. thus, we for loop to save memory
     scores_list = []
     device = classifier_model.device
     for i in tqdm(range(num_prompts * num_responses), desc="Scoring generations"):
@@ -178,7 +192,7 @@ def generate_beam(
     Also return the scores for each kept beam.
     """
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    device = 'cuda:0'
+    device = 'cuda:0'  # Classifier device
     device_type = 'cuda'
     dtype = torch.bfloat16
     torch.set_float32_matmul_precision('high')
@@ -212,19 +226,20 @@ def generate_beam(
                     flattened_prompt_partial_responses.append(prompt_ids[i] + generated_ids[i][j])
                     flattened_partial_response_lengths.append(len(generated_ids[i][j]))
 
-        sampling_params = dict(
-            temperature=temperature,
-            top_p=top_p,
-            skip_special_tokens=False,
-        )
         # compute continuation_ids
         max_lengths = [min(block_size, max_length - flattened_partial_response_lengths[i]) for i in range(len(flattened_prompt_partial_responses))]
-        sampling_params["stop_token_ids"] = stop_token_ids
-        sampling_params_list = [
-            {"max_new_tokens": max_lengths[i], **sampling_params} for i in range(len(flattened_prompt_partial_responses))
-        ]
-        infer_outputs = piref_model.generate(input_ids=flattened_prompt_partial_responses, sampling_params=sampling_params_list)
-        continuation_ids = [x['output_ids'] for x in infer_outputs]
+        
+        # Create vLLM sampling parameters
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max(max_lengths),  # vLLM uses single max_tokens
+            stop_token_ids=stop_token_ids,
+            skip_special_tokens=False,
+        )
+        
+        infer_outputs = piref_model.generate(prompt_token_ids=flattened_prompt_partial_responses, sampling_params=sampling_params)
+        continuation_ids = [list(output.outputs[0].token_ids) for output in infer_outputs]
         infer_engine_dt += time.time() - t0
 
         # score all the continuations. note that while kv cache is modified, the classifier also truncates it so it shouldn't be modified.
@@ -300,7 +315,7 @@ def generate_beam(
 
         postprocess_dt += time.time() - t0
         bar.update(old_num_beams_left-num_beams_left)
-        bar.set_description(f"Queries left: {num_beams_left:3d}, sgl: {infer_engine_dt:.2f}s, classifier: {infer_classifier_dt:.2f}s, postprocess: {postprocess_dt:.2f}s")
+        bar.set_description(f"Queries left: {num_beams_left:3d}, vllm: {infer_engine_dt:.2f}s, classifier: {infer_classifier_dt:.2f}s, postprocess: {postprocess_dt:.2f}s")
     bar.close()
 
     # finally score the generated_ids
@@ -493,7 +508,8 @@ def math_verify_wrapper(args):
 @torch.no_grad()
 def main(args: Args):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    device = 'cuda:0'
+    classifier_device = 'cuda:0'  # Classifier on GPU 0  
+    device = classifier_device  # Keep backwards compatibility 
     dtype = torch.bfloat16
     torch.set_float32_matmul_precision('high')
 
@@ -524,20 +540,20 @@ def main(args: Args):
         with open(args.output_path, "w") as f:
             f.write("")
 
-
-    extra_kwargs = {}
-    piref_model = sgl.Engine(
-        model_path=args.piref_model,
+    # Initialize vLLM engine (will use cuda:1 when script sets CUDA_VISIBLE_DEVICES=1)
+    piref_model = LLM(
+        model=args.piref_model,
         dtype=dtype,
-        mem_fraction_static=args.piref_gpu_util,
-        random_seed=args.seed,
-        skip_tokenizer_init=True,
-        **extra_kwargs,
+        tensor_parallel_size=args.tensor_parallel_size,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.piref_gpu_util,
+        seed=args.seed,
+        skip_tokenizer_init=False,  # vLLM manages tokenizer internally
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.piref_model, padding_side="left")
     model_loading_kwargs = dict(attn_implementation=args.attention_impl, torch_dtype=dtype, use_cache=True)
-    classifier = classifier_lib.Qwen2ForClassifier.from_pretrained(args.classifier_ckpt_path, **model_loading_kwargs).to(device)
+    classifier = classifier_lib.Qwen2ForClassifier.from_pretrained(args.classifier_ckpt_path, **model_loading_kwargs).to(classifier_device)  # Load classifier on GPU 0
     classifier.eval()
     print("Finished loading piref and classifier.")
 
@@ -638,7 +654,6 @@ def main(args: Args):
                     "global_idx": batch["global_idx"][i],
                     "problem": batch["problem"][i],
                     "gt_answer": batch["answer"][i],
-                    "generated_ids": generated_ids[i],
                     "generated_scores": generated_scores[i],
                     "processed_answer": processed_answers[i],
                     "reward": rewards[i],
@@ -652,7 +667,7 @@ def main(args: Args):
         se_reward = 0 if len(rewards) == 1 else torch.std(rewards, correction=1) / (len(rewards) ** 0.5)
         print(f"indices={min(global_indices)}-{max(global_indices)} | size={cur_batch_size} | dt={dt/cur_batch_size:.2f}s per elem | reward={mean_reward} ± {se_reward}")
 
-    print("Finished all batches. Now logging to wandb...")
+    print("Finished all batches. Now logging to file...")
     log_to_server(args)
 
 

@@ -11,7 +11,6 @@ python -u inference_eval.py  \
     --temperature 0.6 \
     --classifier_ckpt_path VGS-AI/DeepSeek-VM-1.5B \
     --num_repetitions 16 \
-    --output_path inference_outputs.jsonl \
+    --output_path inference_outputs_sgl.jsonl \
     --attention_impl flash_attention_2 \
     --search_type beam2 \
-    --neptune_project cornell-rl/oss-infer-eval
